@@ -1,0 +1,519 @@
+---
+title: "Kaggle Titanic"
+author: "John Cook"
+output: pdf_document
+---
+
+#Introduction
+
+In the below RMarkdown File I develop a Random Forest for the Kaggle Titanic Competition.
+
+The competition is to predict who lived and who died on the Titanic. We are given a training set of 891 observations and a test set of 418 observations. The two sets contain 11 columns containing information such as name, age, ticket no., social class, gender,etc. Additionally the training set contains a binary "Survived" column where a 0 indicates death. More information can be found at [](https://www.kaggle.com/c/titanic).
+
+#Setup
+
+
+```{r}
+# setwd to git repo
+setwd('/Users/johncook/repos/Kaggle_Titanic/')
+```
+
+```{r}
+#read in data
+train=data.frame(read.csv('Data/train.csv',header = 1))
+test=data.frame(read.csv('Data/test.csv',header = 1))
+```
+
+```{r}
+#Check to see if necessary packages installed, if not install
+list.of.packages <- c("randomForest", "data.table","tree","ggplot2","dplyr","gsubfn")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+```
+
+
+```{r}
+#Load Libraries:
+library(randomForest)
+library(data.table)
+library(tree)
+library(ggplot2)
+library(dplyr)
+library(gsubfn)
+```
+
+#Initial Analysis
+
+
+```{r}
+head(train)
+```
+
+
+Quick Look at contingency tables and histograms to see which variables seperate the most between died and survived passengers. Clearly Sex is the largest single predictor.
+
+```{r}
+prop.table(table(train$Survived,train$Sex),2)
+prop.table(table(train$Survived,train$Pclass),2)
+ggplot(train,aes(Age,colour=as.factor(Survived)))+geom_histogram()+ggtitle("Histogram of Age Data By Survival")+labs(colour = "Survived")
+prop.table(table(train$SibSp,train$Survived),1)
+prop.table(table(train$Parch,train$Survived),1)
+ggplot(train,aes(Fare,colour=as.factor(Survived)))+geom_histogram()+ggtitle("Histogram of Fare Data By Survival")+labs(colour = "Survived")
+table(train$Embarked,train$Survived)
+```
+
+#Creating New Variables
+
+
+In this section I create new variables from given columns.
+
+
+##Making Column of Titles
+
+In this section I take out the title from each person's name and create a new column. I then group together like title's that are sparse. Combining like titles will prevent overfitting by reducing the variables cardinality(number possible values). Note the underlying problem are the titles that have only a few entries as their Survived proportion's can vary significantly between the training and testing sets.
+
+```{r}
+#Strip out the titles using regex
+train$Title <- strapplyc(as.character(train$Name), ", (.*?)\\.",simplify=T)
+table(train$Title,train$Survived)
+test$Title <- strapplyc(as.character(test$Name), ", (.*?)\\.",simplify=T)
+table(test$Title)
+```
+
+I reduce the number of titles into:
+Mr
+Mrs
+Miss
+Master
+
+and my new classes of:
+Job Title
+Formal Title
+
+```{r}
+train$Title <- as.character(train$Title)
+test$Title <- as.character(test$Title)
+replTitle<- function(repl,rwith){
+  train[train$Title %in% repl,]['Title']=rwith
+  test[test$Title %in% repl,]['Title']=rwith
+  return(train,test)
+}
+Jobs <- c('Capt','Col','Major','Dr',"Rev")
+train[train$Title %in% Jobs,]['Title'] ='Job'
+test[test$Title %in% Jobs,]['Title'] ='Job'
+
+FTitles <- c('Jonkheer','Don','Sir','the Countess','Dona','Lady')
+train[train$Title %in% FTitles,]['Title'] ='Ftitle'
+test[test$Title %in% FTitles,]['Title'] ='Ftitle'
+
+MrsTitles <- c('Mme','Ms')
+train[train$Title %in% MrsTitles,]['Title'] ='Mrs'
+test[test$Title %in% MrsTitles,]['Title'] ='Mrs'
+
+MissTitles <- c('Mlle')
+train[train$Title %in% MissTitles,]['Title'] ='Miss'
+#test[test$Title %in% MissTitles,]['Title'] ='Miss' 
+#Above edited out because Mlle isn't present
+
+train$Title <- as.factor(train$Title)
+test$Title <- factor(test$Title,levels=levels(train$Title))
+
+#At least now the training set has at minimum 5 entries
+
+table(train$Title)
+```
+
+
+
+##Making Columns of Cabin Sections, Number of Cabin rooms, And Room Number.
+
+In this section I split up the Cabin column into the section (the beginning letter of the cabin), the number of cabin rooms booked, and the room number. For example if an entry is "C85 C86". The associated columns would be section C, 2 rooms, and room number 85.
+
+I take the first room number as no cabin rooms purchased by the same person is more than a few rooms apart (Mainly multiple purchasers are heads of a household and buy rooms for there family close to each other).
+
+Unfortunately relatively few passengers have Cabin information so these will be fairly sparse columns.
+
+```{r}
+Cabs=strsplit(as.character(train$Cabin), " ")
+Cabstest=strsplit(as.character(test$Cabin), " ")
+train$Section <- substr(as.character(train$Cabin),1,1)
+test$Section <- substr(as.character(test$Cabin),1,1)
+train$NumRms <- sapply(Cabs,length)
+test$NumRms <- sapply(Cabstest,length)
+#Create a function to deal with character(0) problem for string manipulation in r
+substrMY <- function(x){
+  if (identical(x,character(0))){
+    return(NA)
+  }
+  else{
+  return(substr(x[[1]][1], 2, nchar(x)))
+  }
+}
+train$RNum <- unlist(sapply(Cabs, substrMY))
+test$RNum <- unlist(sapply(Cabstest, substrMY))
+```
+
+
+##Calculating Family Size
+
+Here we calculate family size by adding the Sibling/Spouse column to the Parents/Children column.
+
+```{r}
+train$FSize <- train$SibSp + train$Parch
+test$FSize <- test$SibSp + test$Parch
+```
+
+
+# Identifying Missing and Strange Values
+
+The columns that we will look at in this section are Age and Fare. We have already mentioned the missing values in Cabin.
+
+First we will look at the Fare variable and then at Age.
+
+##Correcting Fare Column
+
+There's 1 NA for Fare in the Test dataset. Additionally we will see below that there are strange values for Fare as well which we will attempt to correct.
+
+
+We fill in the 1 NA for Fare in the test dataset by using the mean of our data which fits criteria most similar to our missing value passenger.
+```{r}
+test <- data.frame(test)
+train <- data.frame(train)
+test %>% summarise_each(funs(sum(is.na(.))))
+test[is.na(test$Fare),]
+#No alike entries in test df but alike entries in train
+test[which(test$Age >50 & test$Pclass=='3' & test$Sex=='male'),]
+train[which(train$Age >50 & train$Pclass=='3' & train$Sex=='male'),]
+#Set it equal to the mean Fare of these rows
+test[is.na(test$Fare),][c('Fare')] <- sum(train[which(train$Age >50 & train$Pclass=='3' & train$Sex=='male'),][c('Fare')])/9
+```
+
+Below we look at the distirbution of Fares and investigate interesting outliers with Fares =0, and >200. If the fares >200 look normal in the other columns, i.e. Should be high class and have cabins.
+
+```{r}
+hist(train$Fare,breaks = c(0:600))
+```
+
+Investigate fares >200. We see that these are all passengers of the top class and most have cabins in B or C. Because of this I will leave these fares as they are as I have little evidence they are "bad data".
+
+```{r}
+train[train$Fare > 200,]
+test[test$Fare > 200,]
+# Doesn't look like anything out of the ordinary will look at the two tickes >500
+train[train$Fare>500,]
+test[test$Fare > 500,]
+#I can believe that these Fares are correct that a really expensive ticket was bought instead of this being a case of wrong data.
+
+```
+
+Investigating fares =0. It is interesting that these people are all male and all but one died. Additionally they all Embarked from the same place. I would suggest that these may be crewman as they are all males of working age but the variation in the other columns refutes this hypothesis. Additionaly this is supposed to be a passenger manifest.
+
+```{r}
+train[train$Fare ==0,]
+test[test$Fare ==0,]
+ggplot(train,aes(Fare,colour=as.factor(Survived)))+geom_histogram(bins = 500)
+```
+
+Below I make sure that passengers with the same Ticket No. paid about the same amount. The below code only outputs values if two different Fares are present for the same Ticket. Unfortunately this is not the case for the Fares of 0 so Ticket # will not be of help.
+
+```{r}
+train$TicketCl <- as.character(train$Ticket)
+uniqs <- unique(train$TicketCl)
+for (i in 1:length(uniqs)){
+  vals<-c()
+  for (j in 1:length(train$TicketCl)){
+  if ((uniqs[i]==train$TicketCl[j])){
+    vals <- append(vals,train$Fare[j])
+    }
+  }
+  if (length(unique(vals))>1){
+  print(vals)
+  print(uniqs[i])
+  print(sqrt(var(vals)))
+  }
+}
+```
+
+I'll set these Fares equal to the median Fare of the corresponding Pclass.
+
+```{r}
+train$FareCl <- train$Fare
+test$FareCl <- test$Fare
+aggregate(Fare~Pclass,train,median)
+train[(train$FareCl == 0)&(train$Pclass==1),]['FareCl'] <- 60.2875
+train[(train$FareCl == 0)&(train$Pclass==2),]['FareCl'] <- 14.2500
+train[(train$FareCl == 0)&(train$Pclass==3),]['FareCl'] <- 8.0500
+test[(test$FareCl == 0)&(test$Pclass==1),]['FareCl'] <- 60.2875
+```
+
+
+##Missing Values in Age
+
+
+```{r}
+#All in Age for the training set
+train %>% group_by(Survived) %>%  summarise_each(funs(sum(is.na(.))))
+
+#Is the percentage of survived significantly different of the NAs then the total population?
+phat=52/(125+52)
+p0=sum(train$Survived)/nrow(train)
+zscore=(phat-p0)/sqrt((p0*(1-p0))/177)
+pvalue2sided=2*pnorm(-abs(zscore))
+pvalue2sided
+```
+
+
+Above the two sided proportion test suggests that the survived proportion is significantly different among the people where age is NA than where age is available. This suggests that a easy technique such as taking the mean or median of Age is not a great approach. This is because some of the variables that are affecting Survival are also affecting who has their Age missing.
+
+
+##Building Model to Predict Age
+
+
+###Age predictor By Random Forest
+
+```{r}
+str(train)
+train$Section <- as.factor(train$Section)
+test$Section <- factor(test$Section,levels=levels(train$Section)) 
+
+train$AgeNas<- is.na(train$Age)
+test$AgeNas <- is.na(test$Age)
+cols=c('Age','Title','Pclass','Fare')
+rf <- randomForest(Age~Title+Pclass+Fare,data=rbind(train[!is.na(train$Age),][cols],test[!is.na(test$Age),][cols]),importance=T)
+rf
+imp <- importance(rf, type=1)
+featureImportance <- data.frame(Feature=row.names(imp), Importance=imp[,1])
+
+p <- ggplot(featureImportance, aes(x=reorder(Feature, Importance), y=Importance)) +
+     geom_bar(stat="identity", fill="#53cfff") +
+     coord_flip() + 
+     theme_light(base_size=20) +
+     xlab("") +
+     ylab("Importance") + 
+     ggtitle("Random Forest Feature Importance\n") +
+     theme(plot.title=element_text(size=18))
+
+p
+
+preds <- predict(rf, rbind(train[is.na(train$Age),][cols],test[is.na(test$Age),][cols]))
+sep <- nrow(train[is.na(train$Age),])
+test[is.na(test$Age),]['Age'] <- preds[(sep+1):length(preds)]
+train[is.na(train$Age),]['Age'] <- preds[1:sep]
+```
+
+
+#Final Variable: Find Relatives who Died/Survived.
+
+The ability to incorporate this variable into the model depends on the question we are trying to answer. If we are trying to predict whether, given peoples information from the travel manifest, they survived or not then use of the given training set in this manner would be unhelpful. However, if answering who among the passengers in their test set survived it seems clear that this variable could be helpful. The underlying assumption to this are that the passengers survival is not independent people's outcome should be related to the outcome of those they were around when the boat crashed, i.e. either people they're related to or who they came with on the boat.
+
+Relatives who died are for people in both train and test who have relatives in train.
+
+```{r}
+train$LName<- strapplyc(as.character(train$Name), "(.*?),",simplify=T)
+test$LName<- strapplyc(as.character(test$Name), "(.*?),",simplify=T)
+```
+
+At first I tried to do this by last name. I knew that there would be mistakes for common last names. Thus I decided to use ticket #. For example, one can see in the last name Andersson that the ticket numbers match the expected familial relations among passengers of the last name Andersson.
+
+```{r}
+train[train$LName =='Andersson',]
+```
+
+In fact I later decided to drop the use of last name altogether. This is because I found some instances where people with the same ticket number do not have the same last name. These people I assume are either related in some way or good enough friends that as the ship was sinking they would group together. This idea of people grouping together is what I am really trying to replicate, i.e. how many people who they would've grouped together with survived/died. Thus last name seems like an unecnessarily strict criteria. However I do both in order to test my hypothesis. It turned out that using ticket no. resulted in a better overall predictor.
+
+```{r}
+#Using Last Name and Ticket Number
+
+train$FamDiedCat <- "Unknown"
+train$FamDiedCont <- 0
+train$FamSurvivedCont <- 0
+train$Ticket <- as.character(train$Ticket)
+for (i in 1:length(train$Ticket)){
+  for (j in 1:length(train$Ticket)){
+  if ((train$Ticket[i]==train$Ticket[j])&(i!=j)&(train$LName[i]==train$LName[j])){
+    if (train$Survived[j]==0){
+      train$FamDiedCont[i]=train$FamDiedCont[i]+1
+    }
+    else{
+      train$FamSurvivedCont[i]=train$FamSurvivedCont[i]+1
+    }
+  }
+}
+}
+
+#Test set
+
+test$FamDiedCat <- "Unknown"
+test$FamDiedCont <- 0
+test$FamSurvivedCont <- 0
+test$Ticket <- as.character(test$Ticket)
+for (i in 1:length(test$Ticket)){
+  for (j in 1:length(train$Ticket)){
+  if ((test$Ticket[i]==train$Ticket[j])&(test$LName[i]==train$LName[j])){
+    if (train$Survived[j]==0){
+      test$FamDiedCont[i]=test$FamDiedCont[i]+1
+    }
+    else{
+      test$FamSurvivedCont[i]=test$FamSurvivedCont[i]+1
+    }
+  }
+}
+}
+
+#Using Ticket Number Except for If Ticket == "LINE" using LName
+
+train$FamDiedCat <- "Unknown"
+train$TickDiedCont <- 0
+train$TickSurvivedCont <- 0
+train$Ticket<- as.character(train$Ticket)
+train$TicketCl <- train$Ticket
+LINErows <- train$Ticket=="LINE"
+train[LINErows,]["TicketCl"]<-paste(train$Ticket[LINErows],train$LName[LINErows])
+for (i in 1:length(train$TicketCl)){
+  for (j in 1:length(train$TicketCl)){
+  if ((train$TicketCl[i]==train$TicketCl[j])&(i!=j)){
+    if (train$Survived[j]==0){
+      train$TickDiedCont[i]=train$TickDiedCont[i]+1
+    }
+    else{
+      train$TickSurvivedCont[i]=train$TickSurvivedCont[i]+1
+    }
+  }
+}
+}
+
+#Test set
+
+test$TickDiedCat <- "Unknown"
+test$TickDiedCont <- 0
+test$TickSurvivedCont <- 0
+test$TicketCl <- as.character(test$Ticket)
+LINErows <- test$Ticket=="LINE"
+test[LINErows,]["TicketCl"]<-paste(test$Ticket[LINErows],test$LName[LINErows])
+for (i in 1:length(test$TicketCl)){
+  for (j in 1:length(train$TicketCl)){
+  if ((test$TicketCl[i]==train$TicketCl[j])){
+    if (train$Survived[j]==0){
+      test$TickDiedCont[i]=test$TickDiedCont[i]+1
+    }
+    else{
+      test$TickSurvivedCont[i]=test$TickSurvivedCont[i]+1
+    }
+  }
+}
+}
+```
+
+
+#Models
+
+##Baseline Model
+
+From the preliminary analysis it is clear that the variable sex clearly has an effect on survival. Thus the easiest baseline model is one in which females survive and males die.
+
+```{r}
+test$SimplestPred<-0
+test[test$Sex=='female',]['SimplestPred']<-1
+ToTest<-test[c('PassengerId','SimplestPred')]
+colnames(ToTest) <- c('PassengerId','Survived')
+write.csv(ToTest,'./SimplestModel.csv',row.names = F)
+```
+
+
+Thsi model gets a score of 76.5% on the test data. This is a very high score for such a simple model, however we are able to improve accuracy using other variables in a random forest model.
+
+##Random Forest Model Without Relatives Survival as variables
+
+The below model uses Passenger class, Sex, Age, Fare, Family size, Section, Embarked, and Title. I chose the parameters to include based on the results from both the 1/10th of the data I set aside for testing as well as the accuracy on the testing set. The model tested at 78.5 % according to Kaggle. Below are in-depth reports as to the performance of the random forest and a bar chart of variable importance.
+
+```{r}
+str(train)
+test$Embarked <- as.character(test$Embarked)
+test$Embarked <- factor(test$Embarked,levels=levels(train$Embarked))
+train$Survived <- as.factor(train$Survived)
+train$Title <- as.factor(train$Title)
+test$Title <- factor(test$Title,levels=levels(train$Title))
+train$Section <- as.factor(train$Section)
+test$Section <- factor(test$Section,levels=levels(train$Section))
+library(randomForest)
+set.seed(1234)
+train1ind=sample(nrow(train),floor(nrow(train)/10))
+trainTest <- train[train1ind,]
+train1 <- train[-train1ind,]
+params <- c("Pclass","Sex","Age","Fare","FSize","Section","Embarked","Title")
+fit.rf= randomForest(train1[params], as.factor(train1$Survived),xtest = trainTest[params],trainTest$Survived ,importance=T,proximity=T,ntree=500,mtry = 2,keep.forest=TRUE)
+fit.rf
+sum(abs(as.numeric(fit.rf$test$predicted) - as.numeric(trainTest$Survived)))/nrow(trainTest)
+
+round(importance(fit.rf), 2)
+
+imp <- importance(fit.rf, type=1)
+featureImportance <- data.frame(Feature=row.names(imp), Importance=imp[,1])
+
+p <- ggplot(featureImportance, aes(x=reorder(Feature, Importance), y=Importance)) +
+     geom_bar(stat="identity", fill="#53cfff") +
+     coord_flip() + 
+     theme_light(base_size=20) +
+     xlab("") +
+     ylab("Importance") + 
+     ggtitle("Random Forest Feature Importance\n") +
+     theme(plot.title=element_text(size=18))
+
+p
+
+levels(test$Section)<- levels(train$Section)
+test$RF1pred=predict(fit.rf, test[params])
+table(test$RF1pred)
+ToTest<-test[c('PassengerId','RF1pred')]
+colnames(ToTest) <- c('PassengerId','Survived')
+write.csv(ToTest,'./RF1.csv',row.names = F)
+```
+
+
+##Random Forest Model With Relatives Survival as variables
+
+The below model uses Passenger class, Sex, Age, Fare, Family size, Section, Embarked, Title, and the count of know deaths and survival among same Ticket members. I chose the parameters to include based on the results from both the 1/10th of the data I set aside for testing as well as the accuracy on the testing set. The model tested at 82.3 % according to Kaggle. Below are in-depth reports as to the performance of the random forest and a bar chart of variable importance.
+
+```{r}
+str(train)
+test$Embarked <- as.character(test$Embarked)
+test$Embarked <- factor(test$Embarked,levels=levels(train$Embarked))
+train$Survived <- as.factor(train$Survived)
+train$Title <- as.factor(train$Title)
+test$Title <- factor(test$Title,levels=levels(train$Title))
+train$Section <- as.factor(train$Section)
+test$Section <- factor(test$Section,levels=levels(train$Section))
+library(randomForest)
+set.seed(1234)
+train1ind=sample(nrow(train),floor(nrow(train)/10))
+trainTest <- train[train1ind,]
+train1 <- train[-train1ind,]
+params <- c("Pclass","Sex","Age","Fare","FSize","Section","Embarked","Title","TickDiedCont","TickSurvivedCont")
+fit.rf= randomForest(train1[params], as.factor(train1$Survived),xtest = trainTest[params],trainTest$Survived ,importance=T,proximity=T,ntree=500,mtry = 2,keep.forest=TRUE)
+fit.rf
+sum(abs(as.numeric(fit.rf$test$predicted) - as.numeric(trainTest$Survived)))/nrow(trainTest)
+
+round(importance(fit.rf), 2)
+
+imp <- importance(fit.rf, type=1)
+featureImportance <- data.frame(Feature=row.names(imp), Importance=imp[,1])
+
+p <- ggplot(featureImportance, aes(x=reorder(Feature, Importance), y=Importance)) +
+     geom_bar(stat="identity", fill="#53cfff") +
+     coord_flip() + 
+     theme_light(base_size=20) +
+     xlab("") +
+     ylab("Importance") + 
+     ggtitle("Random Forest Feature Importance\n") +
+     theme(plot.title=element_text(size=18))
+
+p
+
+trainpred=predict(fit.rf, train[params])
+levels(test$Section)<- levels(train$Section)
+test$RF1pred=predict(fit.rf, test[params])
+table(test$RF1pred)
+ToTest<-test[c('PassengerId','RF1pred')]
+colnames(ToTest) <- c('PassengerId','Survived')
+write.csv(ToTest,'./RF1.csv',row.names = F)
+```
